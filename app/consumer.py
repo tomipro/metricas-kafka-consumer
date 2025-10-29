@@ -1,6 +1,7 @@
 import os, sys, json, time, signal, random
 import requests
 from confluent_kafka import Consumer, KafkaError, KafkaException
+from typing import Any, Dict
 
 def getenv_required(name: str) -> str:
     v = os.getenv(name)
@@ -22,7 +23,7 @@ MAX_RETRIES = int(os.getenv("MAX_RETRIES", "5"))
 conf = {
     "bootstrap.servers": BOOTSTRAP,
     "group.id": GROUP_ID,
-    "enable.auto.commit": False,   # commit sólo tras POST ok (at-least-once)
+    "enable.auto.commit": False,   # commit sólo tras POST ok
     "auto.offset.reset": "latest",
     "session.timeout.ms": 10000,
     "max.poll.interval.ms": 300000,
@@ -32,7 +33,6 @@ conf = {
 }
 
 session = requests.Session()
-# API Gateway header exacto como lo usás
 session.headers.update({"x-api-key": API_KEY, "Content-Type": "application/json"})
 
 _running = True
@@ -46,68 +46,92 @@ def jlog(level: str, **fields):
     fields["level"] = level
     print(json.dumps(fields, ensure_ascii=False), flush=True)
 
-# ---- Normalización para Lambda de ingesta ----
-def normalize_for_ingest(msg: dict) -> dict:
-    """
-    Normaliza mensajes del core al contrato de tu API:
-    - Si ya trae "type" en root -> passthrough.
-    - Si trae "event_type" y "payload" dict -> flatten payload al root (sin pisar claves existentes),
-      setea type=event_type y deriva ts de createdAt/ts/timestamp.
-    - Conserva el payload original en msg["payload"] para trazabilidad.
-    """
-    if not isinstance(msg, dict):
-        return {"raw": msg}
+def _maybe_parse_json_str(s: str) -> Any:
+    s = s.strip()
+    if not s:
+        return s
+    if s[0] not in "{[":
+        return s
+    try:
+        return json.loads(s)
+    except Exception:
+        return s
 
-    # Ya viene listo
-    if "type" in msg and isinstance(msg.get("type"), str):
-        # Garantizar ts si existiera en variantes
-        if "ts" not in msg:
-            ts = (msg.get("createdAt") or msg.get("timestamp"))
-            if ts:
-                msg["ts"] = ts
-        return msg
+def _destringify(obj: Any, depth: int = 0) -> Any:
+    """Recorre dict/list y convierte strings con JSON embebido a objetos reales.
+       Limita profundidad por seguridad."""
+    if depth > 10:
+        return obj
+    if isinstance(obj, dict):
+        out: Dict[str, Any] = {}
+        for k, v in obj.items():
+            if isinstance(v, str):
+                v2 = _maybe_parse_json_str(v)
+                out[k] = _destringify(v2, depth + 1)
+            else:
+                out[k] = _destringify(v, depth + 1)
+        return out
+    elif isinstance(obj, list):
+        return [_destringify(v, depth + 1) for v in obj]
+    elif isinstance(obj, str):
+        return _maybe_parse_json_str(obj)
+    else:
+        return obj
 
-    out = dict(msg)  # copiamos todo lo que ya vino
-    et = out.pop("event_type", None) or out.get("type")
-    if et and "type" not in out:
-        out["type"] = et
+def _normalize_keys(ev: Dict[str, Any]) -> Dict[str, Any]:
+    """No cambia el esquema, solo agrega alias útiles si faltan."""
+    norm = dict(ev)
 
-    payload = out.get("payload")
-    if isinstance(payload, dict):
-        # Flatten: subir todas las claves del payload al root si NO existen ya
-        for k, v in payload.items():
-            if k not in out:
-                out[k] = v
+    # event_type
+    if "event_type" not in norm:
+        if "eventType" in norm:
+            norm["event_type"] = norm["eventType"]
+        elif "name" in norm:
+            norm["event_type"] = norm["name"]
 
-    # Derivar ts desde candidatos comunes
-    if "ts" not in out:
-        ts = (
-            out.get("createdAt")
-            or (payload.get("createdAt") if isinstance(payload, dict) else None)
-            or out.get("timestamp")
-            or (payload.get("timestamp") if isinstance(payload, dict) else None)
-        )
-        if ts:
-            out["ts"] = ts
+    # schema_version
+    if "schema_version" not in norm:
+        if "schemaVersion" in norm:
+            norm["schema_version"] = norm["schemaVersion"]
 
-    return out
+    # occurred_at
+    if "occurred_at" not in norm:
+        if "occurredAt" in norm:
+            norm["occurred_at"] = norm["occurredAt"]
+        elif "timestamp" in norm:
+            norm["occurred_at"] = norm["timestamp"]
+
+    # source
+    if "source" not in norm:
+        if "producer" in norm:
+            norm["source"] = norm["producer"]
+
+    # Si existen 'payload' o 'data' como string JSON ya fueron destringificados por _destringify.
+    return norm
 
 def post_event(payload_bytes: bytes) -> bool:
-    # Intenta decodificar; si no, manda raw
+    # 1) decodificar el value del record
     try:
-        raw = json.loads(payload_bytes.decode("utf-8", errors="ignore"))
+        raw = payload_bytes.decode("utf-8", errors="ignore")
+        payload = json.loads(raw)
     except Exception:
-        raw = {"raw": payload_bytes.decode("utf-8", errors="ignore")}
+        # No es JSON => enviar como raw encapsulado
+        payload = {"raw": payload_bytes.decode("utf-8", errors="ignore")}
 
-    data = normalize_for_ingest(raw)
+    # 2) des-stringificar cualquier JSON embebido (payload, data, etc.)
+    payload = _destringify(payload)
 
-    # Reintentos con backoff + jitter
+    # 3) normalizar alias de campos comunes (opcional, no rompe nada)
+    if isinstance(payload, dict):
+        payload = _normalize_keys(payload)
+
+    # 4) POST con reintentos exponenciales
     for i in range(1, MAX_RETRIES + 1):
         try:
-            r = session.post(API_URL, json=data, timeout=POST_TIMEOUT_S)
+            r = session.post(API_URL, json=payload, timeout=POST_TIMEOUT_S)
             if r.status_code < 400:
                 return True
-            jlog("warn", msg="POST non-2xx", status=r.status_code)
+            jlog("warn", msg="POST non-2xx", status=r.status_code, body=r.text[:300])
         except Exception as e:
             jlog("warn", msg="POST exception", error=str(e))
         time.sleep((0.5 * i) + random.uniform(0, 0.5))
@@ -131,7 +155,6 @@ def main():
                     if m.error().code() != KafkaError._PARTITION_EOF:
                         jlog("warn", msg="kafka error", error=str(m.error()))
                     continue
-
                 ok = post_event(m.value())
                 if not ok:
                     failed += 1
@@ -142,8 +165,6 @@ def main():
                     processed += 1
                     if processed % 100 == 0:
                         jlog("info", event="progress", processed=processed, failed=failed)
-
-            # Commit sólo si TODO el batch salió ok (at-least-once)
             if all_ok:
                 try:
                     c.commit(asynchronous=False)
@@ -154,7 +175,7 @@ def main():
     finally:
         try:
             c.close()
-        except Exception:
+        except:
             pass
         jlog("info", event="shutdown", processed=processed, failed=failed)
 
