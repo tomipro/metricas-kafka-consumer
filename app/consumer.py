@@ -92,6 +92,33 @@ def _alias(v: Dict[str, Any], dst: str, *candidates: str):
             v[dst] = v[c]
             return
 
+def _apply_type_specific_mappings(ev: Dict[str, Any]) -> Dict[str, Any]:
+    """Ajustes puntuales para tipos donde tu Lambda exige campos en raíz con nombres concretos."""
+    t = ev.get("type")
+
+    # --- search.search.performed ---
+    if t == "search.search.performed":
+        ev.setdefault("searchId",  ev.get("search_id") or ev.get("id") or ev.get("searchID"))
+        ev.setdefault("userId",    ev.get("user_id")   or ev.get("uid") or ev.get("user"))
+        ev.setdefault("origin",    ev.get("from")      or ev.get("orig") or ev.get("originAirport"))
+        ev.setdefault("destination", ev.get("to")      or ev.get("dest") or ev.get("destinationAirport"))
+        ev.setdefault("category",  ev.get("type")      or ev.get("categoryName") or ev.get("product"))
+        ev.setdefault("performedAt",
+            ev.get("performed_at") or ev.get("performedAt") or
+            ev.get("occurred_at") or ev.get("occurredAt") or
+            ev.get("timestamp") or ev.get("createdAt"))
+        if "ts" not in ev and ev.get("performedAt"):
+            ev["ts"] = ev["performedAt"]
+
+    # --- reservations.reservation.updated ---
+    if t == "reservations.reservation.updated":
+        ev.setdefault("reservationId", ev.get("reservation_id") or ev.get("id") or ev.get("resId"))
+        if "newStatus" not in ev and "status" in ev:
+            ev["newStatus"] = ev["status"]
+        ev.setdefault("ts", ev.get("updatedAt") or ev.get("occurred_at") or ev.get("timestamp"))
+
+    return ev
+
 def _normalize_generic(msg: Dict[str, Any]) -> Dict[str, Any]:
     """
     Normaliza eventos a un formato que tu Lambda entiende:
@@ -106,10 +133,11 @@ def _normalize_generic(msg: Dict[str, Any]) -> Dict[str, Any]:
     # Caso: ya viene listo
     if "type" in out and isinstance(out.get("type"), str):
         if "ts" not in out:
-            ts = out.get("createdAt") or out.get("updatedAt") or out.get("timestamp") or out.get("occurred_at") or out.get("occurredAt")
+            ts = (out.get("createdAt") or out.get("updatedAt") or
+                  out.get("timestamp") or out.get("occurred_at") or out.get("occurredAt"))
             if ts:
                 out["ts"] = ts
-        return out
+        return _apply_type_specific_mappings(out)
 
     # Aliases útiles
     _alias(out, "event_type", "eventType", "name")  # name -> event_type por compat
@@ -121,21 +149,18 @@ def _normalize_generic(msg: Dict[str, Any]) -> Dict[str, Any]:
 
     # Patrón A: event_type + payload dict
     if isinstance(out.get("event_type"), str) and isinstance(payload, dict):
-        norm = {"type": out["event_type"]}
-        # flatten de payload (non-destructive sobre norm)
+        norm: Dict[str, Any] = {"type": out["event_type"]}
         for k, v in payload.items():
-            norm.setdefault(k, v)
-        # ts derivado
-        ts = norm.get("createdAt") or norm.get("updatedAt") or out.get("occurred_at") or out.get("timestamp")
+            norm.setdefault(k, v)  # flatten payload
+        ts = (norm.get("createdAt") or norm.get("updatedAt") or
+              out.get("occurred_at") or out.get("timestamp"))
         if ts:
             norm["ts"] = ts
-        # mantener payload original por trazabilidad
-        norm["payload"] = payload
-        # conservar metadatos útiles si estaban
+        norm["payload"] = payload  # trazabilidad
         for k in ("schema_version", "source", "producer", "correlation_id", "id"):
             if k in out:
                 norm[k] = out[k]
-        return norm
+        return _apply_type_specific_mappings(norm)
 
     # Patrón B: wrapper name/data/occurred_at
     if isinstance(out.get("name"), str) and isinstance(data, dict):
@@ -149,7 +174,7 @@ def _normalize_generic(msg: Dict[str, Any]) -> Dict[str, Any]:
         for k in ("schema_version", "source", "producer", "correlation_id", "id"):
             if k in out:
                 norm[k] = out[k]
-        return norm
+        return _apply_type_specific_mappings(norm)
 
     # Patrón C: flatten best-effort si hay payload/data dict aunque no haya event_type/name
     if isinstance(payload, dict):
@@ -159,16 +184,15 @@ def _normalize_generic(msg: Dict[str, Any]) -> Dict[str, Any]:
         for k, v in data.items():
             out.setdefault(k, v)
 
-    # Intentar inferir type si no existe
-    _alias(out, "type", "event_type", "name")
+    _alias(out, "type", "event_type", "name")  # intentar inferir type
 
-    # Derivar ts
     if "ts" not in out:
-        ts = out.get("createdAt") or out.get("updatedAt") or out.get("timestamp") or out.get("occurred_at") or out.get("occurredAt")
+        ts = (out.get("createdAt") or out.get("updatedAt") or
+              out.get("timestamp") or out.get("occurred_at") or out.get("occurredAt"))
         if ts:
             out["ts"] = ts
 
-    return out
+    return _apply_type_specific_mappings(out)
 
 # ---------- Envío a API ----------
 def post_event(payload_bytes: bytes) -> bool:
@@ -186,11 +210,19 @@ def post_event(payload_bytes: bytes) -> bool:
     if isinstance(obj, dict):
         obj = _normalize_generic(obj)
 
-    # 4) POST con reintentos y backoff+jitter
+    # 4) POST con reintentos; no commitear si la Lambda “rechaza” en el body
     for i in range(1, MAX_RETRIES + 1):
         try:
             r = session.post(API_URL, json=obj, timeout=POST_TIMEOUT_S)
             if r.status_code < 400:
+                try:
+                    body = r.json()
+                    sc = body.get("statusCode")
+                    if sc is not None and int(sc) >= 400:
+                        jlog("warn", msg="lambda rejected", statusCode=sc, body=str(body)[:300])
+                        raise RuntimeError(f"Lambda rejected with statusCode {sc}")
+                except ValueError:
+                    pass  # body no-JSON, lo damos por bueno
                 return True
             jlog("warn", msg="POST non-2xx", status=r.status_code, body=r.text[:300])
         except Exception as e:
@@ -200,7 +232,8 @@ def post_event(payload_bytes: bytes) -> bool:
 
 # ---------- Loop principal ----------
 def main():
-    jlog("info", event="boot", bootstrap=BOOTSTRAP, topics=TOPICS, api_url=API_URL, group_id=GROUP_ID, auto_offset_reset=AUTO_OFFSET_RESET)
+    jlog("info", event="boot", bootstrap=BOOTSTRAP, topics=TOPICS,
+         api_url=API_URL, group_id=GROUP_ID, auto_offset_reset=AUTO_OFFSET_RESET)
     c = Consumer(conf)
     c.subscribe(TOPICS)
     processed = failed = 0
@@ -227,7 +260,8 @@ def main():
                 else:
                     processed += 1
                     if DEBUG_MSGS:
-                        jlog("info", event="delivered", topic=m.topic(), partition=m.partition(), offset=m.offset())
+                        jlog("info", event="delivered",
+                             topic=m.topic(), partition=m.partition(), offset=m.offset())
                     elif processed % LOG_EVERY == 0:
                         jlog("info", event="progress", processed=processed, failed=failed)
 
