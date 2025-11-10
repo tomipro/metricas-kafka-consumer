@@ -1,9 +1,10 @@
+# consumer.py
 import os, sys, json, time, signal, random
 from datetime import datetime, timezone
 import requests
 from confluent_kafka import Consumer, KafkaError, KafkaException
 
-# ------- util env -------
+# ---------------- Env & config ----------------
 def getenv_required(name: str) -> str:
     v = os.getenv(name)
     if not v:
@@ -20,18 +21,23 @@ BATCH_SIZE = int(os.getenv("BATCH_SIZE", "50"))
 POLL_TIMEOUT_S = float(os.getenv("POLL_TIMEOUT_S", "1.0"))
 POST_TIMEOUT_S = float(os.getenv("POST_TIMEOUT_S", "10"))
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "5"))
-AUTO_OFFSET_RESET = os.getenv("AUTO_OFFSET_RESET", "latest")
-MAX_QPS = float(os.getenv("POST_MAX_QPS", "12"))  # cap opcional
-MIN_INTERVAL = 1.0 / MAX_QPS if MAX_QPS > 0 else 0.0
+AUTO_OFFSET_RESET = os.getenv("AUTO_OFFSET_RESET", "latest")  # earliest para backfill
 LOG_EVERY = int(os.getenv("LOG_EVERY", "100"))
+
+# Limitar QPS de POST (opcional)
+MAX_QPS = float(os.getenv("POST_MAX_QPS", "12"))  # 0 para desactivar
+MIN_INTERVAL = 1.0 / MAX_QPS if MAX_QPS > 0 else 0.0
+
+# Whitelist opcional de prefijos de tipos (coma-separados), ej: "users.,reservations."
+EVENT_TYPES_WHITELIST = [s.strip() for s in os.getenv("EVENT_TYPES_WHITELIST", "").split(",") if s.strip()]
 
 conf = {
     "bootstrap.servers": BOOTSTRAP,
     "group.id": GROUP_ID,
     "enable.auto.commit": False,
-    "auto.offset.reset": AUTO_OFFSET_RESET,     # latest o earliest
+    "auto.offset.reset": AUTO_OFFSET_RESET,
     "session.timeout.ms": 10000,
-    "max.poll.interval.ms": 900000,             # 15 min para evitar MAXPOLL en ráfagas/retries
+    "max.poll.interval.ms": 900000,   # 15 min para tolerar reintentos sin MAXPOLL
     "fetch.min.bytes": 1,
     "fetch.wait.max.ms": 500,
     "socket.timeout.ms": 20000,
@@ -51,12 +57,35 @@ def jlog(level: str, **fields):
     fields["level"] = level
     print(json.dumps(fields, ensure_ascii=False), flush=True)
 
-# ------- normalizadores -------
+# ---------------- Helpers ----------------
+def _headers_to_dict(hlist):
+    out = {}
+    if not hlist:
+        return out
+    for k, v in hlist:
+        if not k:
+            continue
+        try:
+            out[k] = v.decode("utf-8") if isinstance(v, (bytes, bytearray)) else v
+        except Exception:
+            out[k] = str(v) if v is not None else None
+    return out
+
+def _json_maybe(x):
+    if isinstance(x, (dict, list)):
+        return x
+    if not isinstance(x, str):
+        return x
+    try:
+        return json.loads(x)
+    except Exception:
+        return x
+
 def _coerce_iso_z(v):
-    """Devuelve YYYY-MM-DDTHH:MM:SSZ (UTC) a partir de string ISO, epoch ms/s, o None."""
+    """Devuelve YYYY-MM-DDTHH:MM:SSZ (UTC) a partir de string ISO, epoch ms/s o None."""
     if v is None:
         return None
-    # epoch ms / s
+    # epoch?
     if isinstance(v, (int, float)) or (isinstance(v, str) and v.strip().isdigit()):
         x = float(v)
         if x > 1e12:  # ms
@@ -66,99 +95,140 @@ def _coerce_iso_z(v):
     s = str(v).strip()
     try:
         s2 = s.rstrip("Zz")
-        dt = datetime.fromisoformat(s2)  # acepta con milisegundos
+        dt = datetime.fromisoformat(s2)  # acepta fracciones
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         else:
             dt = dt.astimezone(timezone.utc)
         return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
     except Exception:
-        return s  # si no se pudo, se manda crudo y la Lambda decidirá
+        return s  # deja que la Lambda decida
 
-def _json_maybe(s):
-    if isinstance(s, (dict, list)):
-        return s
-    if not isinstance(s, str):
-        return s
-    try:
-        return json.loads(s)
-    except Exception:
-        return s
-
-def _normalize_event(obj: dict) -> dict:
-    """
-    Acepta:
-      - eventos "flat" con campos en raíz
-      - eventos con {"payload": "<json-string>"} o {"payload": {...}}
-    Produce:
-      {
-        "type": <string>,
-        "userId"/"reservationId"/... (alias),
-        "ts": ISO-UTC-Z sin fracciones,
-        "payload": <objeto original razonable>
-      }
-    """
-    if not isinstance(obj, dict):
-        return {"payload": obj}
-
-    # 1) doble-decoding si viene como string dentro de "payload"
-    lvl1 = obj
-    lvl2 = _json_maybe(lvl1.get("payload"))
-    base = lvl2 if isinstance(lvl2, dict) else lvl1
-
-    # 2) detectar tipo
+def _derive_type(base: dict) -> str | None:
+    # intenta en varios lugares
     t = (
         base.get("type") or base.get("event_type") or base.get("eventType")
-        or base.get("name")
+        or base.get("name") or (base.get("headers", {}) or {}).get("eventType")
     )
-    # algunos en core: { id, name, occurred_at, schema_version, data: {...} }
-    data = base.get("data") if isinstance(base.get("data"), dict) else base
+    return t
 
-    # 3) alias de IDs comunes
-    ev = dict(base)  # copia para no mutar
-    ev.update({
-        "event_type": t or base.get("event_type"),
-        "userId": data.get("userId") or base.get("userId") or data.get("user_id"),
-        "reservationId": data.get("reservationId") or base.get("reservationId")
-                           or data.get("resId") or data.get("reservation_id"),
-        "paymentId": data.get("paymentId") or base.get("paymentId"),
-    })
+def _allowed_type(t: str) -> bool:
+    if not EVENT_TYPES_WHITELIST:
+        return True
+    return any(t.startswith(prefix) for prefix in EVENT_TYPES_WHITELIST)
 
-    # 4) timestamp: prioriza ts / occurredAt / createdAt / updatedAt / performedAt
+# ---------------- Normalización por mensaje ----------------
+def _normalize_from_core_ingress(env: dict) -> dict:
+    """
+    Mensajes que vienen con el “sobre” del core:
+      {
+        messageId, eventType, schemaVersion, occurredAt, producer, correlationId,
+        idempotencyKey, payload: "<json-string>" | { ... }
+      }
+    """
+    event_type = _derive_type(env)
+    # payload puede ser string JSON: doble-decoding
+    p1 = _json_maybe(env.get("payload"))
+    if isinstance(p1, str):
+        p1 = _json_maybe(p1)
+    if not isinstance(p1, dict):
+        p1 = {"raw": p1}
+
+    ev = dict(p1)  # base del negocio
+    # setear campos canónicos que la Lambda espera
+    if event_type:
+        ev["type"] = event_type
+
+    # ts: preferí occurredAt, sino timestamp/createdAt/updatedAt, sino lo que venga en p1
     ts_candidate = (
-        ev.get("ts") or base.get("ts") or base.get("occurredAt") or base.get("occurred_at")
-        or base.get("createdAt") or data.get("createdAt") or base.get("updatedAt")
-        or data.get("updatedAt") or base.get("performedAt") or data.get("performedAt")
-        or base.get("timestamp") or base.get("time") or data.get("timestamp")
+        env.get("occurredAt") or env.get("timestamp")
+        or p1.get("ts") or p1.get("performedAt") or p1.get("updatedAt")
+        or p1.get("createdAt") or p1.get("occurredAt")
     )
     ev["ts"] = _coerce_iso_z(ts_candidate)
 
-    # 5) mappings por tipo que tu Lambda exige
-    t_effective = t or ev.get("event_type")
-
-    if t_effective == "reservations.reservation.updated":
-        # newStatus desde alias
-        cand = (data.get("newStatus") or data.get("status") or data.get("reservationStatus")
-                or data.get("new_status") or base.get("status") or base.get("newStatus"))
+    # mappings por tipo (ejemplo conocido)
+    if event_type == "reservations.reservation.updated":
+        cand = (p1.get("newStatus") or p1.get("status") or p1.get("reservationStatus")
+                or p1.get("new_status"))
         if cand is not None:
             ev["newStatus"] = cand
 
-    # 6) normalizar timestamps conocidos dentro del objeto por consistencia
+    # normalizar tiempos comunes dentro del payload
     for k in ("createdAt", "updatedAt", "performedAt", "occurredAt"):
         if k in ev:
             ev[k] = _coerce_iso_z(ev[k])
-        if k in data:
-            data[k] = _coerce_iso_z(data[k])
 
-    # 7) reconstruir payload razonable que conserve el original "útil"
-    ev["payload"] = data if data is not base else base
-    # type canónico
-    if t_effective:
-        ev["type"] = t_effective
+    # anexar meta útil (no interfiere con la validación de tu Lambda)
+    ev.setdefault("meta", {})
+    ev["meta"].update({
+        "coreMessageId": env.get("messageId"),
+        "schemaVersion": env.get("schemaVersion"),
+        "producer": env.get("producer"),
+        "correlationId": env.get("correlationId"),
+        "idempotencyKey": env.get("idempotencyKey"),
+        "source": "core.ingress"
+    })
+    return ev
+
+def _normalize_generic(env: dict) -> dict:
+    """
+    Camino genérico para topics que no son core.ingress.
+    Soporta payload doble-encoded y saca type/ts/ids “razonables”.
+    """
+    # si hay payload, intentá decodificar
+    p1 = _json_maybe(env.get("payload"))
+    if isinstance(p1, str):
+        p1 = _json_maybe(p1)
+
+    base = p1 if isinstance(p1, dict) else env
+    ev = dict(base)
+
+    t = _derive_type(env) or _derive_type(base)
+    if t:
+        ev["type"] = t
+
+    # ids comunes
+    data = base if isinstance(base, dict) else {}
+    ev.setdefault("userId", data.get("userId") or env.get("userId") or data.get("user_id"))
+    ev.setdefault("reservationId", data.get("reservationId") or env.get("reservationId")
+                  or data.get("resId") or data.get("reservation_id"))
+    ev.setdefault("paymentId", data.get("paymentId") or env.get("paymentId"))
+
+    ts_candidate = (
+        env.get("ts") or base.get("ts") or env.get("occurredAt") or env.get("occurred_at")
+        or env.get("createdAt") or base.get("createdAt") or env.get("updatedAt")
+        or base.get("updatedAt") or env.get("performedAt") or base.get("performedAt")
+        or env.get("timestamp") or base.get("timestamp")
+    )
+    ev["ts"] = _coerce_iso_z(ts_candidate)
+
+    if t == "reservations.reservation.updated":
+        cand = (data.get("newStatus") or data.get("status") or data.get("reservationStatus")
+                or data.get("new_status") or env.get("status") or env.get("newStatus"))
+        if cand is not None:
+            ev["newStatus"] = cand
+
+    for k in ("createdAt", "updatedAt", "performedAt", "occurredAt"):
+        if k in ev:
+            ev[k] = _coerce_iso_z(ev[k])
+
+    # si el negocio “real” estaba dentro de payload y era dict, dejalo como payload
+    if isinstance(p1, dict):
+        ev["payload"] = p1
 
     return ev
 
-# ------- HTTP pacing -------
+def _normalize_event(envelope: dict, topic: str) -> dict:
+    # Si es el sobre canónico de core.ingress, usá el camino específico
+    if topic == "core.ingress" or (
+        "eventType" in envelope and "payload" in envelope and "occurredAt" in envelope
+    ):
+        return _normalize_from_core_ingress(envelope)
+    # En caso contrario, camino genérico
+    return _normalize_generic(envelope)
+
+# ---------------- Rate limit pacing ----------------
 _last_post = 0.0
 def _pace():
     global _last_post
@@ -170,21 +240,53 @@ def _pace():
         time.sleep(wait)
     _last_post = time.time()
 
-# ------- POST con manejo de 429/400 en body -------
-def post_event(payload_bytes: bytes) -> bool:
-    # decode bytes → obj
+# ---------------- POST logic ----------------
+def post_event(msg) -> bool:
+    # 1) armar “sobre” con value + headers útiles
     try:
-        raw = json.loads(payload_bytes.decode("utf-8", errors="ignore"))
+        env = json.loads(msg.value().decode("utf-8", errors="ignore"))
     except Exception:
-        raw = {"raw": payload_bytes.decode("utf-8", errors="ignore")}
+        env = {"raw": msg.value().decode("utf-8", errors="ignore")}
 
-    obj = _normalize_event(raw)
+    headers = _headers_to_dict(msg.headers())
+    if headers:
+        env.setdefault("headers", headers)
+        # propagar metadatos comunes si no están
+        if "eventType" in headers and "eventType" not in env:
+            env["eventType"] = headers["eventType"]
+        if "name" in headers and "name" not in env:
+            env["name"] = headers["name"]
+        if "timestamp" in headers and "ts" not in env:
+            env["ts"] = headers["timestamp"]
 
+    # 2) normalizar al contrato de la Lambda
+    obj = _normalize_event(env, topic=msg.topic())
+
+    # 3) fallback de type si todavía faltara
+    if not obj.get("type"):
+        obj["type"] = f"{msg.topic()}.unknown"
+        jlog("warn", msg="missing type after normalization", topic=msg.topic(), sample=str(env)[:200])
+
+    # 4) whitelist opcional
+    if not _allowed_type(obj.get("type", "")):
+        jlog("info", msg="skipped by whitelist", type=obj.get("type"))
+        return True
+
+    # 5) meta de Kafka (útil para auditoría)
+    obj.setdefault("meta", {})
+    obj["meta"].update({
+        "topic": msg.topic(),
+        "partition": msg.partition(),
+        "offset": msg.offset(),
+        "key": (msg.key().decode("utf-8", "ignore") if msg.key() else None),
+    })
+
+    # 6) POST con manejo de 429 y de {statusCode:400} en el body
     for i in range(1, MAX_RETRIES + 1):
         try:
             _pace()
             r = session.post(API_URL, json=obj, timeout=POST_TIMEOUT_S)
-            # 429: rate-limit → backoff fuerte, NO commit
+
             if r.status_code == 429:
                 retry_after = int(r.headers.get("Retry-After", "0") or 0)
                 sleep_s = retry_after if retry_after > 0 else min(30, 2 ** i)
@@ -192,13 +294,11 @@ def post_event(payload_bytes: bytes) -> bool:
                 time.sleep(sleep_s)
                 continue
 
-            # HTTP >=400: no commit
             if r.status_code >= 400:
                 jlog("warn", msg="POST non-2xx", status=r.status_code, body=r.text[:200])
                 time.sleep(min(10, 0.5 * i))
                 continue
 
-            # La API devuelve 200 pero la Lambda puede responder {statusCode:400} en el body
             try:
                 body = r.json()
             except Exception:
@@ -206,18 +306,19 @@ def post_event(payload_bytes: bytes) -> bool:
 
             if isinstance(body, dict) and body.get("statusCode", 200) >= 400:
                 jlog("warn", msg="lambda rejected", statusCode=body.get("statusCode"), body=str(body)[:300])
-                # backoff leve y reintentar; no commitear
                 time.sleep(min(10, 0.5 * i))
                 continue
 
-            return True  # OK lógico
+            # éxito lógico
+            return True
+
         except Exception as e:
             jlog("warn", msg="POST exception", error=str(e))
             time.sleep(min(10, 0.5 * i + random.uniform(0, 0.5)))
 
-    return False
+    return False  # agotó retries
 
-# ------- loop principal -------
+# ---------------- Main loop ----------------
 def main():
     jlog("info", event="boot", bootstrap=BOOTSTRAP, topics=TOPICS, api_url=API_URL, group_id=GROUP_ID)
     c = Consumer(conf)
@@ -236,7 +337,8 @@ def main():
                     if m.error().code() != KafkaError._PARTITION_EOF:
                         jlog("warn", msg="kafka error", error=str(m.error()))
                     continue
-                ok = post_event(m.value())
+
+                ok = post_event(m)
                 if not ok:
                     failed += 1
                     all_ok = False
@@ -246,6 +348,7 @@ def main():
                     processed += 1
                     if processed % LOG_EVERY == 0:
                         jlog("info", event="progress", processed=processed, failed=failed)
+
             if all_ok:
                 try:
                     c.commit(asynchronous=False)
